@@ -1,11 +1,11 @@
 import os
-import glob
 import logging
 import asyncio
+import math
 from typing import List, Dict, Any
 
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, Command
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
 from aiogram.types import (
     Message,
     InlineQuery,
@@ -18,27 +18,22 @@ from aiogram.types import (
 )
 import yt_dlp
 
-# --- НАСТРОЙКИ И ЛОГИРОВАНИЕ ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТЕЛЕГРАМ_ТОКЕН_ЗДЕСЬ")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН")
 DOWNLOAD_DIR = "downloads"
+ITEMS_PER_PAGE = 5
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Создаем папку для временных загрузок, если её нет
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+SEARCH_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ YT-DLP ---
 
-def search_tracks(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """
-    Поиск треков на различных площадках с помощью yt-dlp.
-    Сначала ищет по SoundCloud, если нет результатов — по YouTube/Music.
-    """
+def search_tracks_all(query: str, max_results: int = 25) -> List[Dict[str, Any]]:
+    """Поиск треков на SoundCloud с обходом блокировок хостинга."""
     ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
@@ -48,9 +43,8 @@ def search_tracks(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     }
 
     results = []
-    
-    # Запрос для поиска: сначала пробуем SoundCloud, затем YouTube
-    search_queries = [f"scsearch{limit}:{query}", f"ytsearch{limit}:{query}"]
+    # Используем SoundCloud как основной стабильный источник для Render
+    search_queries = [f"scsearch{max_results}:{query}", f"bcsearch{max_results}:{query}"]
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         for search_q in search_queries:
@@ -60,32 +54,30 @@ def search_tracks(query: str, limit: int = 5) -> List[Dict[str, Any]]:
                     for entry in info['entries']:
                         if not entry:
                             continue
+                        
+                        duration = entry.get('duration', 0)
+                        try:
+                            duration = int(duration) if duration else 0
+                        except (ValueError, TypeError):
+                            duration = 0
+
                         results.append({
                             'id': entry.get('id'),
                             'url': entry.get('url') or entry.get('webpage_url'),
                             'title': entry.get('title', 'Без названия'),
-                            'uploader': entry.get('uploader') or entry.get('artist') or 'Неизвестный исполнитель',
-                            'duration': entry.get('duration', 0),
-                            'source': 'SoundCloud' if 'scsearch' in search_q else 'YouTube/Yandex'
+                            'uploader': entry.get('uploader') or entry.get('artist') or 'Исполнитель',
+                            'duration': duration,
+                            'source': 'SoundCloud' if 'scsearch' in search_q else 'Bandcamp'
                         })
-                        if len(results) >= limit:
-                            break
             except Exception as e:
-                logger.error(f"Ошибка поиска для {search_q}: {e}")
-            
-            if len(results) >= limit:
-                break
+                logger.error(f"Ошибка поиска: {e}")
 
     return results
 
 
 def download_audio_file(url_or_query: str) -> Dict[str, Any]:
-    """
-    Загрузка и конвертация аудио в формат MP3.
-    Возвращает словарь с путями к файлу и метаданными.
-    """
+    """Загрузка аудио в MP3 с дополнительными аргументами для стабильности."""
     output_template = os.path.join(DOWNLOAD_DIR, '%(id)s_%(title)s.%(ext)s')
-    
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
@@ -96,190 +88,183 @@ def download_audio_file(url_or_query: str) -> Dict[str, Any]:
         }],
         'quiet': True,
         'no_warnings': True,
+        'nocheckcertificate': True,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url_or_query, download=True)
         filename = ydl.prepare_filename(info)
-        # Так как postprocessor меняет расширение на mp3
         base_name, _ = os.path.splitext(filename)
-        mp3_filename = f"{base_name}.mp3"
+        
+        duration = info.get('duration', 0)
+        try:
+            duration = int(duration) if duration else None
+        except (ValueError, TypeError):
+            duration = None
 
         return {
-            'file_path': mp3_filename,
+            'file_path': f"{base_name}.mp3",
             'title': info.get('title', 'Аудиозапись'),
             'performer': info.get('uploader') or info.get('artist') or 'Исполнитель',
-            'duration': int(info.get('duration', 0)) if info.get('duration') else None
+            'duration': duration
         }
 
 
-# --- ОБРАБОТЧИКИ КОМАНД ЛИЧНЫХ СООБЩЕНИЙ ---
+def build_search_keyboard(query_key: str, page: int = 0) -> InlineKeyboardMarkup:
+    tracks = SEARCH_CACHE.get(query_key, [])
+    total_pages = max(1, math.ceil(len(tracks) / ITEMS_PER_PAGE))
+    
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    current_tracks = tracks[start_idx:end_idx]
+
+    keyboard = []
+    for idx, track in enumerate(current_tracks):
+        real_idx = start_idx + idx
+        btn_text = f"🎵 {track['title'][:28]} - {track['uploader'][:15]}"
+        keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"dl_{query_key}_{real_idx}")])
+
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page_{query_key}_{page - 1}"))
+    
+    nav_buttons.append(InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+    
+    if page < total_pages - 1:
+        nav_buttons.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"page_{query_key}_{page + 1}"))
+
+    keyboard.append(nav_buttons)
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    """
-    Приветственное сообщение и инструкция по использованию.
-    """
-    text = (
-        "👋 **Привет! Я музыкальный бот.**\n\n"
-        "🎶 **Как мною пользоваться:**\n"
-        "1. Отправь мне **ссылку** (SoundCloud, Yandex Music, YouTube и др.) или **название трека** прямо сюда.\n"
-        "2. Вызови меня в **любом чате**, написав `@имя_бота название трека` (Инлайн-режим)!"
-    )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer("👋 Отправь название песни/артиста или ссылку на SoundCloud/YouTube!")
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_user_text(message: Message):
-    """
-    Обработка текстового сообщения от пользователя (поиск или ссылка).
-    """
     query = message.text.strip()
-    status_msg = await message.answer("🔍 Ищу музыку, подождите...")
+    status_msg = await message.answer("🔍 Ищу треки...")
 
-    # Если отправлена прямая ссылка
     if query.startswith("http://") or query.startswith("https://"):
-        await status_msg.edit_text("⏳ Загружаю аудио по ссылке...")
         try:
             audio_data = await asyncio.to_thread(download_audio_file, query)
-            audio_file = FSInputFile(audio_data['file_path'])
-
             await message.answer_audio(
-                audio=audio_file,
+                audio=FSInputFile(audio_data['file_path']),
                 title=audio_data['title'],
                 performer=audio_data['performer'],
                 duration=audio_data['duration']
             )
             await status_msg.delete()
-            # Удаляем временный файл
             if os.path.exists(audio_data['file_path']):
                 os.remove(audio_data['file_path'])
         except Exception as e:
-            logger.error(f"Ошибка загрузки: {e}")
-            await status_msg.edit_text("❌ Не удалось скачать аудио по данной ссылке.")
+            logger.error(f"Ошибка загрузки по ссылке: {e}")
+            await status_msg.edit_text("❌ Ошибка при скачивании по ссылке.")
         return
 
-    # Если отправлен обычный текст — запускаем поиск
-    try:
-        results = await asyncio.to_thread(search_tracks, query, 5)
-        if not results:
-            await status_msg.edit_text("😔 Ничего не найдено по вашему запросу.")
-            return
+    tracks = await asyncio.to_thread(search_tracks_all, query, 25)
+    if not tracks:
+        await status_msg.edit_text("😔 Ничего не найдено.")
+        return
 
-        builder = InlineKeyboardMarkup(inline_keyboard=[])
-        for idx, track in enumerate(results):
-            # Сохраняем ссылку в callback_data (или укороченный идентификатор)
-            btn = InlineKeyboardButton(
-                text=f"🎵 {track['title'][:30]} - {track['uploader'][:20]}",
-                callback_data=f"dl_{idx}"
-            )
-            builder.inline_keyboard.append([btn])
+    cache_key = str(abs(hash(query)))[:10]
+    SEARCH_CACHE[cache_key] = tracks
 
-        # Сохраним результаты временным образом во вспомогательном сообщении
-        await status_msg.edit_text(
-            f"🔎 **Результаты поиска по запросу:** `{query}`\nВыберите трек для скачивания:",
-            reply_markup=builder,
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Ошибка поиска: {e}")
-        await status_msg.edit_text("❌ Произошла ошибка при поиске.")
+    markup = build_search_keyboard(cache_key, page=0)
+    await status_msg.edit_text(
+        f"🔎 **Результаты по запросу:** `{query}`\n*(Найдено: {len(tracks)})*",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data.startswith("page_"))
+async def handle_page_change(callback: CallbackQuery):
+    _, cache_key, page_str = callback.data.split("_")
+    page = int(page_str)
+
+    if cache_key not in SEARCH_CACHE:
+        await callback.answer("Сессия поиска истекла. Напишите запрос заново.", show_alert=True)
+        return
+
+    markup = build_search_keyboard(cache_key, page=page)
+    await callback.message.edit_reply_markup(reply_markup=markup)
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("dl_"))
 async def handle_download_callback(callback: CallbackQuery):
-    """
-    Обработка нажатия на кнопку скачивания выбранного трека из меню поиска.
-    """
-    await callback.answer("Начинаю скачивание...")
-    await callback.message.edit_text("⏳ Идет скачивание и конвертация в MP3...")
+    _, cache_key, idx_str = callback.data.split("_")
+    idx = int(idx_str)
 
-    # Получаем исходный текст запроса из контекста сообщения
+    tracks = SEARCH_CACHE.get(cache_key, [])
+    if not tracks or idx >= len(tracks):
+        await callback.answer("Ошибка: трек не найден.", show_alert=True)
+        return
+
+    track = tracks[idx]
+    await callback.answer("Скачиваю...")
+    progress_msg = await callback.message.answer("⏳ Скачиваю файл...")
+
     try:
-        # Для простоты заново вызываем скачивание по тексту нажатой кнопки
-        button_text = ""
-        for row in callback.message.reply_markup.inline_keyboard:
-            if row[0].callback_data == callback.data:
-                button_text = row[0].text.replace("🎵 ", "")
-                break
-
-        audio_data = await asyncio.to_thread(download_audio_file, f"ytsearch1:{button_text}")
-        audio_file = FSInputFile(audio_data['file_path'])
-
+        audio_data = await asyncio.to_thread(download_audio_file, track['url'])
         await callback.message.answer_audio(
-            audio=audio_file,
+            audio=FSInputFile(audio_data['file_path']),
             title=audio_data['title'],
             performer=audio_data['performer'],
             duration=audio_data['duration']
         )
-        await callback.message.delete()
-
+        await progress_msg.delete()
         if os.path.exists(audio_data['file_path']):
             os.remove(audio_data['file_path'])
     except Exception as e:
-        logger.error(f"Ошибка при скачивании из callback: {e}")
-        await callback.message.edit_text("❌ Ошибка при скачивании выбранного трека.")
+        logger.error(f"Ошибка скачивания: {e}")
+        await progress_msg.edit_text("❌ Ошибка при скачивании трека.")
 
-
-# --- ОБРАБОТЧИК ИНЛАЙН-РЕЖИМА (@bot_username запрос) ---
 
 @dp.inline_query()
 async def handle_inline_query(inline_query: InlineQuery):
-    """
-    Инлайн-поиск. Позволяет использовать бота в любом чате: @bot_name название
-    """
     query = inline_query.query.strip()
     if not query:
         return
 
     try:
-        # Получаем до 5 результатов
-        tracks = await asyncio.to_thread(search_tracks, query, 5)
+        tracks = await asyncio.to_thread(search_tracks_all, query, 10)
         results = []
 
         for idx, track in enumerate(tracks):
-            duration_str = f"{track['duration'] // 60}:{track['duration'] % 60:02d}" if track['duration'] else "Неизвестно"
-            
-            # Текст сообщения, который отправится в чат при клике на результат
-            content_text = (
+            dur = track['duration']
+            dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else "--:--"
+
+            content = (
                 f"🎧 **{track['title']}**\n"
                 f"👤 Исполнитель: {track['uploader']}\n"
-                f"⏱ Длительность: {duration_str}\n"
-                f"🔗 Источник: {track['url']}"
+                f"🔗 {track['url']}"
             )
-
-            # Кнопка для быстрой отправки или перехода в бота
+            
             bot_info = await bot.get_me()
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="📥 Скачать в боте",
-                    url=f"https://t.me/{bot_info.username}?start=dl"
-                )
+            btn = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📥 Скачать в боте", url=f"https://t.me/{bot_info.username}")
             ]])
 
-            article = InlineQueryResultArticle(
+            results.append(InlineQueryResultArticle(
                 id=str(idx),
-                title=f"{track['title']}",
-                description=f"👤 {track['uploader']} | ⏱ {duration_str} | [{track['source']}]",
-                input_message_content=InputTextMessageContent(
-                    message_text=content_text,
-                    parse_mode="Markdown"
-                ),
-                reply_markup=keyboard
-            )
-            results.append(article)
+                title=track['title'],
+                description=f"👤 {track['uploader']} | ⏱ {dur_str}",
+                input_message_content=InputTextMessageContent(message_text=content, parse_mode="Markdown"),
+                reply_markup=btn
+            ))
 
         await inline_query.answer(results, cache_time=10)
-
     except Exception as e:
         logger.error(f"Ошибка инлайн-поиска: {e}")
 
 
-# --- ТОЧКА ВХОДА ---
-
 async def main():
-    logger.info("Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
+                        
