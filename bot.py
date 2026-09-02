@@ -17,6 +17,7 @@ from aiogram.types import (
     FSInputFile
 )
 import yt_dlp
+from aiohttp import web
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН")
 DOWNLOAD_DIR = "downloads"
@@ -43,7 +44,6 @@ def search_tracks_all(query: str, max_results: int = 25) -> List[Dict[str, Any]]
     }
 
     results = []
-    # Используем SoundCloud как основной стабильный источник для Render
     search_queries = [f"scsearch{max_results}:{query}", f"bcsearch{max_results}:{query}"]
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -76,7 +76,7 @@ def search_tracks_all(query: str, max_results: int = 25) -> List[Dict[str, Any]]
 
 
 def download_audio_file(url_or_query: str) -> Dict[str, Any]:
-    """Загрузка аудио в MP3 с дополнительными аргументами для стабильности."""
+    """Загрузка аудио в MP3."""
     output_template = os.path.join(DOWNLOAD_DIR, '%(id)s_%(title)s.%(ext)s')
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -262,9 +262,25 @@ async def handle_inline_query(inline_query: InlineQuery):
         logger.error(f"Ошибка инлайн-поиска: {e}")
 
 
+# Фейковый хэндлер для Render
+async def handle_health_check(request):
+    return web.Response(text="Bot is running!")
+
+
 async def main():
+    # Запускаем фоновый веб-сервер для прохождения проверок портов Render
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    # Запускаем бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-                        
+    
